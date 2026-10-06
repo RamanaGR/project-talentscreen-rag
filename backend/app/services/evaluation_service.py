@@ -6,15 +6,8 @@ fallback to simple heuristic scoring when no LLM is available.
 """
 
 from typing import Dict, Any
-from app.core.config import settings
 from app.core.logging import logger
-
-# Optional import — evaluation is a non-critical feature
-try:
-    import anthropic as anthropic_sdk
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
+from app.services.llm_service import LLMService
 
 
 class EvaluationService:
@@ -27,28 +20,15 @@ class EvaluationService:
     """
 
     def __init__(self):
-        self.client = None
-        anthropic_key = settings.ANTHROPIC_API_KEY
-        if ANTHROPIC_AVAILABLE and anthropic_key and "sk-ant" in anthropic_key:
-            try:
-                self.client = anthropic_sdk.Anthropic(api_key=anthropic_key)
-                logger.info("[EvaluationService] Initialized with Anthropic Claude.")
-            except Exception as e:
-                logger.warning(f"[EvaluationService] Could not init client: {e}. Using heuristic fallback.")
-        else:
-            logger.info("[EvaluationService] No LLM available. Using heuristic evaluation.")
+        self.llm_service = LLMService()
 
     def _invoke(self, prompt: str) -> str:
         """Call the LLM for evaluation."""
-        if not self.client:
-            return '{"score": 0.5, "reasoning": "LLM not available for evaluation"}'
         try:
-            response = self.client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=1024,
-                messages=[{"role": "user", "content": prompt}]
+            return self.llm_service.invoke(
+                "You are a precise RAG evaluation assistant. Return only the requested JSON.",
+                prompt,
             )
-            return response.content[0].text
         except Exception as e:
             logger.error(f"Evaluation LLM call failed: {e}")
             return '{"score": 0.5, "reasoning": "Evaluation failed"}'

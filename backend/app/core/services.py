@@ -4,7 +4,7 @@ Initializes and exposes global, reusable service singletons:
   - VectorDB: Milvus dense vector storage management
   - EmbeddingService: all-MiniLM-L6-v2 embedding generation
   - HybridRetrievalService: BM25 keyword + Milvus vector retrieval fusion
-  - LLMService: Bedrock Claude 3.5 Sonnet / LLM helper actions
+  - LLMService: Configured local or cloud LLM helper actions
 """
 
 from app.db.vector_db import VectorDB
