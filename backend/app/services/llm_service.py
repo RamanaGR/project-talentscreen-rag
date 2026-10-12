@@ -1,10 +1,11 @@
 """LLM Service (PDF Parts 6, 9).
 
 Multi-provider LLM service with fallback chain:
-1. AWS Bedrock (Claude via Amazon Bedrock — production)
-2. Anthropic Direct API (Claude — local development)
-3. OpenAI (GPT-4 — secondary fallback)
-4. Mock responses (offline development)
+1. Ollama (local development)
+2. AWS Bedrock (Claude via Amazon Bedrock — production)
+3. Anthropic Direct API (Claude)
+4. OpenAI (GPT-4)
+5. G4F or mock responses (offline development)
 
 Provides:
 - Query Understanding (Part 6.1): Extract skills, roles, experience, intent
@@ -18,6 +19,7 @@ Provides:
 import json
 import re
 from typing import List, Dict, Any, Generator
+import httpx
 from app.core.config import settings
 from app.core.logging import logger
 
@@ -49,16 +51,30 @@ except ImportError:
 
 
 class LLMService:
+    """Provider-neutral text generation for search, ingestion, and chat."""
+
     def __init__(self):
+        self.provider = settings.LLM_PROVIDER.strip().lower()
         self.use_bedrock = False
         self.bedrock_client = None
         self.anthropic_client = None
         self.openai_llm = None
+        self.use_ollama = False
+        self.use_g4f = False
         self._init_clients()
 
     def _init_clients(self):
+        # Keep local Ollama isolated from cloud credentials and clients.
+        if self.provider == "ollama":
+            self.use_ollama = True
+            logger.info(
+                f"[LLM] Configured local Ollama: {settings.OLLAMA_BASE_URL} "
+                f"(model={settings.OLLAMA_MODEL})"
+            )
+            return
+
         # 1. AWS Bedrock (Production)
-        if BOTO3_AVAILABLE:
+        if self.provider == "bedrock" and BOTO3_AVAILABLE:
             aws_id = settings.AWS_ACCESS_KEY_ID
             aws_secret = settings.AWS_SECRET_ACCESS_KEY
             if aws_id and aws_secret and "your_aws" not in aws_id.lower():
@@ -75,26 +91,26 @@ class LLMService:
                     logger.error(f"[LLM] Bedrock init failed: {e}")
             else:
                 logger.info("[LLM] AWS Bedrock credentials not configured. Skipping.")
-        else:
+        elif self.provider == "bedrock":
             logger.info("[LLM] boto3 not installed. Bedrock unavailable.")
 
         # 2. Anthropic Direct API (Local Dev — uses key from .env)
         anthropic_key = settings.ANTHROPIC_API_KEY
-        if ANTHROPIC_AVAILABLE and anthropic_key and "sk-ant" in anthropic_key:
+        if self.provider == "anthropic" and ANTHROPIC_AVAILABLE and anthropic_key and "sk-ant" in anthropic_key:
             try:
                 self.anthropic_client = anthropic_sdk.Anthropic(api_key=anthropic_key)
                 logger.info("[LLM] Initialized Anthropic Claude (direct API).")
             except Exception as e:
                 logger.error(f"[LLM] Anthropic init failed: {e}")
         else:
-            if not ANTHROPIC_AVAILABLE:
+            if self.provider == "anthropic" and not ANTHROPIC_AVAILABLE:
                 logger.info("[LLM] 'anthropic' package not installed. Skipping.")
-            else:
+            elif self.provider == "anthropic":
                 logger.info("[LLM] Anthropic API key not configured. Skipping.")
 
         # 3. OpenAI (Secondary fallback)
         openai_key = settings.OPENAI_API_KEY
-        if OPENAI_AVAILABLE and openai_key and "your_openai" not in openai_key.lower():
+        if self.provider == "openai" and OPENAI_AVAILABLE and openai_key and "your_openai" not in openai_key.lower():
             try:
                 self.openai_llm = ChatOpenAI(
                     model_name="gpt-4-turbo",
@@ -105,14 +121,27 @@ class LLMService:
             except Exception as e:
                 logger.error(f"[LLM] OpenAI init failed: {e}")
         # 4. G4F (GPT4Free) Fallback
-        if G4F_AVAILABLE:
+        if self.provider == "g4f" and G4F_AVAILABLE:
             self.use_g4f = True
             logger.info("[LLM] Initialized G4F (GPT4Free) for free API access.")
-        else:
+        elif self.provider == "g4f":
             self.use_g4f = False
+            logger.info("[LLM] G4F is unavailable. Using mock fallback.")
+        elif self.provider not in {"bedrock", "anthropic", "openai"}:
+            logger.warning(f"[LLM] Unknown provider '{self.provider}'. Using mock fallback.")
 
     def invoke(self, system_prompt: str, user_prompt: str) -> str:
-        """Invoke LLM with fallback chain: Bedrock → Anthropic → OpenAI → Mock."""
+        """Generate one response using the configured provider.
+
+        A selected provider never falls through to a different remote provider.
+        """
+        if self.use_ollama:
+            try:
+                return self._invoke_ollama(system_prompt, user_prompt)
+            except Exception as e:
+                logger.error(f"[LLM] Ollama invocation failed: {e}. Using mock fallback.")
+                return self._get_mock_response(user_prompt, system_prompt)
+
         # 1. AWS Bedrock
         if self.use_bedrock and self.bedrock_client:
             try:
@@ -171,6 +200,28 @@ class LLMService:
 
         # 5. Mock fallback
         return self._get_mock_response(user_prompt, system_prompt)
+
+    def _invoke_ollama(self, system_prompt: str, user_prompt: str) -> str:
+        """Call Ollama's non-streaming local chat endpoint."""
+        response = httpx.post(
+            f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat",
+            json={
+                "model": settings.OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "stream": False,
+                "options": {"temperature": 0.2},
+            },
+            timeout=settings.OLLAMA_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        content = payload.get("message", {}).get("content")
+        if not isinstance(content, str):
+            raise ValueError("Ollama response did not contain message.content")
+        return content
 
     # ================================================================
     # QUERY PROCESSING (PDF Part 6)
@@ -324,6 +375,15 @@ class LLMService:
         )
         user_prompt = f"Recruiter Query: {query}\n\nCONTEXT:\n{context_text}"
 
+        # Ollama streams newline-delimited JSON from its local HTTP endpoint.
+        if self.use_ollama:
+            try:
+                yield from self._stream_ollama(system_prompt, user_prompt)
+            except Exception as e:
+                logger.error(f"[LLM] Ollama streaming failed: {e}. Using mock fallback.")
+                yield from self._stream_mock(query)
+            return
+
         # 1. AWS Bedrock Streaming
         if self.use_bedrock and self.bedrock_client:
             try:
@@ -401,6 +461,37 @@ class LLMService:
         for i in range(0, len(words), 3):
             word_chunk = " ".join(words[i:i+3]) + " "
             yield _TextChunk(word_chunk)
+
+    def _stream_ollama(self, system_prompt: str, user_prompt: str) -> Generator[Any, None, None]:
+        """Translate Ollama JSONL stream events into application text chunks."""
+        with httpx.stream(
+            "POST",
+            f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/chat",
+            json={
+                "model": settings.OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "stream": True,
+                "options": {"temperature": 0.2},
+            },
+            timeout=settings.OLLAMA_TIMEOUT_SECONDS,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                payload = json.loads(line)
+                content = payload.get("message", {}).get("content", "")
+                if content:
+                    yield _TextChunk(content)
+
+    def _stream_mock(self, query: str) -> Generator[Any, None, None]:
+        """Yield the existing offline response in small chunks."""
+        words = self._get_mock_response(query).split(" ")
+        for i in range(0, len(words), 3):
+            yield _TextChunk(" ".join(words[i:i + 3]) + " ")
 
     def _build_context(self, context_documents: List[Dict[str, Any]]) -> str:
         """Context Building (PDF Part 9.2).

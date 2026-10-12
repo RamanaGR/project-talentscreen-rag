@@ -8,15 +8,8 @@ hiring policies, recruitment SOPs, and internal knowledge documents.
 import json
 import re
 from typing import Dict, Any, List
-from app.core.config import settings
 from app.core.logging import logger
-
-# Optional LLM imports — metadata extraction gracefully degrades without them
-try:
-    import anthropic as anthropic_sdk
-    ANTHROPIC_AVAILABLE = True
-except ImportError:
-    ANTHROPIC_AVAILABLE = False
+from app.services.llm_service import LLMService
 
 
 class MetadataExtractor:
@@ -27,16 +20,7 @@ class MetadataExtractor:
     """
 
     def __init__(self):
-        self.anthropic_client = None
-        anthropic_key = settings.ANTHROPIC_API_KEY
-        if ANTHROPIC_AVAILABLE and anthropic_key and "sk-ant" in anthropic_key:
-            try:
-                self.anthropic_client = anthropic_sdk.Anthropic(api_key=anthropic_key)
-                logger.info("[MetadataExtractor] Initialized with Anthropic Claude for metadata extraction.")
-            except Exception as e:
-                logger.warning(f"[MetadataExtractor] Could not init Anthropic client: {e}. Using regex fallback.")
-        else:
-            logger.info("[MetadataExtractor] No LLM available. Using regex-based metadata extraction.")
+        self.llm_service = LLMService()
 
     def detect_document_type(self, text: str) -> str:
         """Detect document type from content analysis."""
@@ -85,18 +69,17 @@ class MetadataExtractor:
         if not document_type:
             document_type = self.detect_document_type(text)
         
-        # Try LLM-based extraction first
-        if self.anthropic_client:
-            try:
-                return self._extract_with_llm(text, document_type)
-            except Exception as e:
-                logger.warning(f"LLM metadata extraction failed: {e}. Falling back to regex.")
+        # Try the configured provider before using the deterministic fallback.
+        try:
+            return self._extract_with_llm(text, document_type)
+        except Exception as e:
+            logger.warning(f"LLM metadata extraction failed: {e}. Falling back to regex.")
         
         # Regex-based fallback
         return self._extract_with_regex(text, document_type)
 
     def _extract_with_llm(self, text: str, document_type: str) -> Dict[str, Any]:
-        """Extract metadata using Anthropic Claude."""
+        """Extract metadata using the configured LLM provider."""
         prompt = f"""Extract professional metadata from the following {document_type} text.
 Return ONLY a valid JSON object with these fields:
 - "document_type": "{document_type}"
@@ -112,12 +95,7 @@ Return ONLY a valid JSON object with these fields:
 Document Text (first 3000 chars):
 {text[:3000]}
 """
-        response = self.anthropic_client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        text_response = response.content[0].text
+        text_response = self.llm_service.invoke("", prompt)
         
         # Extract JSON from response
         match = re.search(r'\{.*\}', text_response, re.DOTALL)
